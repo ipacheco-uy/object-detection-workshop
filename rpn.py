@@ -3,14 +3,20 @@ import numpy as np
 import tensorflow as tf
 
 from PIL import Image, ImageDraw
-from tensorflow.contrib import slim
-from tensorflow.contrib.slim.nets import resnet_v1
+from tensorflow.contrib.framework.python.ops import arg_scope
 
+from resnet import resnet_v1_101, resnet_arg_scope
+
+
+_R_MEAN = 123.68
+_G_MEAN = 116.78
+_B_MEAN = 103.94
 
 ANCHOR_BASE_SIZE = 256
 ANCHOR_RATIOS = [0.5, 1, 2]
 ANCHOR_SCALES = [0.125, 0.25, 0.5, 1, 2]
-ANCHOR_STRIDE = 16
+
+OUTPUT_STRIDE = 16
 
 PRE_NMS_TOP_N = 12000
 POST_NMS_TOP_N = 2000
@@ -218,8 +224,8 @@ def generate_anchors(feature_map_shape):
     with tf.variable_scope('generate_anchors'):
         grid_width = feature_map_shape[2]  # width
         grid_height = feature_map_shape[1]  # height
-        shift_x = tf.range(grid_width) * ANCHOR_STRIDE
-        shift_y = tf.range(grid_height) * ANCHOR_STRIDE
+        shift_x = tf.range(grid_width) * OUTPUT_STRIDE
+        shift_y = tf.range(grid_height) * OUTPUT_STRIDE
         shift_x, shift_y = tf.meshgrid(shift_x, shift_y)
 
         shift_x = tf.reshape(shift_x, [-1])
@@ -243,7 +249,8 @@ def generate_anchors(feature_map_shape):
         all_anchors = tf.reshape(
             all_anchors, (-1, 4)
         )
-        return all_anchors
+
+    return all_anchors
 
 
 def filter_proposals(proposals, scores):
@@ -312,21 +319,17 @@ def apply_nms(proposals, scores):
 def build_base_network(inputs):
     """Obtain the feature map for an input image."""
     # Pre-process inputs as required by the Resnet (just substracting means).
-    # TODO: Can these be imported from slim?
-    _R_MEAN = 123.68
-    _G_MEAN = 116.78
-    _B_MEAN = 103.94
     processed_inputs = inputs - [_R_MEAN, _G_MEAN, _B_MEAN]
 
     # Initialize TF Slim's Resnet implementation, using its arg_scope in order
     # to get batchnorm into the model. TODO: Why isn't it added if not?
-    with slim.arg_scope(resnet_v1.resnet_utils.resnet_arg_scope()):
-        _, endpoints = resnet_v1.resnet_v1_101(
+    with arg_scope(resnet_arg_scope()):
+        _, endpoints = resnet_v1_101(
             processed_inputs,
             is_training=False,
             num_classes=None,
             global_pool=False,
-            output_stride=16,
+            output_stride=OUTPUT_STRIDE,
         )
 
     feature_map = endpoints['resnet_v1_101/block3']
@@ -355,7 +358,7 @@ def build_rpn(feature_map):
         kernel_regularizer=tf.contrib.layers.l2_regularizer(0.0005),
         name='rpn/cls_conv',
     )
-    rpn_cls_score = tf.reshape(rpn_cls, [-1, 2])  # TODO: Why two classes?
+    rpn_cls_score = tf.reshape(rpn_cls, [-1, 2])
     rpn_cls_prob = tf.nn.softmax(rpn_cls_score)
 
     rpn_bbox = tf.layers.conv2d(
@@ -374,6 +377,14 @@ def build_rpn(feature_map):
 
 
 def build_model(inputs):
+    """Build the whole model.
+
+    Args:
+        inputs: A Tensor holding the image, of shape `(1, height, width, 3)`.
+
+    Returns:
+
+    """
     # Build the base network.
     feature_map = build_base_network(inputs)
 
@@ -386,7 +397,7 @@ def build_model(inputs):
     proposals = decode(anchors, rpn_bbox_pred)
 
     # Get the (positive-object) scores from the RPN.
-    # TODO: Can this be avoided? If not, change name at least.
+    # TODO: Could be just one dimension, right? (If not for compatibility.)
     scores = tf.reshape(rpn_cls_prob[:, 1], [-1])
 
     # Filter proposals with negative areas.
