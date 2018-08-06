@@ -326,8 +326,7 @@ def build_base_network(inputs):
     with arg_scope(resnet_arg_scope()):
         _, endpoints = resnet_v1_101(
             processed_inputs,
-            is_training=False,
-            num_classes=None,
+            training=False,
             global_pool=False,
             output_stride=OUTPUT_STRIDE,
         )
@@ -426,11 +425,55 @@ def main(image_path):
         tf.local_variables_initializer()
     )
 
-    saver = tf.train.Saver()
+    to_restore = {}
+    pretrained_vars = tf.get_collection(
+        tf.GraphKeys.GLOBAL_VARIABLES,
+        scope='resnet_v1_101'
+    )
+    for var in pretrained_vars:
+        if 'batch_normalization' in var.op.name:
+            new_name = var.op.name.replace(
+                'batch_normalization',
+                'BatchNorm',
+            )
+            to_restore[new_name] = var
+            print(new_name, '=>', var.op.name)
+        elif 'conv2d' in var.op.name:
+            new_name = var.op.name.replace(
+                'conv2d/kernel',
+                'weights',
+            )
+            to_restore[new_name] = var
+            print(new_name, '=>', var.op.name)
+        else:
+            to_restore[var.op.name] = var
+        # if 'shortcut/batch_normalization' in var.op.name:
+        #     new_name = var.op.name.replace(
+        #         'shortcut/batch_normalization',
+        #         'shortcut/BatchNorm',
+        #     )
+        #     to_restore[new_name] = var
+        #     print(new_name, '=>', var.op.name)
+        # elif 'shortcut/conv2d' in var.op.name:
+        #     new_name = var.op.name.replace(
+        #         'shortcut/conv2d/kernel',
+        #         'shortcut/weights',
+        #     )
+        #     to_restore[new_name] = var
+        #     print(new_name, '=>', var.op.name)
+
+    rpn_vars = tf.get_collection(
+        tf.GraphKeys.GLOBAL_VARIABLES,
+        scope='rpn'
+    )
+    for var in rpn_vars:
+        to_restore[var.op.name] = var
+
+    saver = tf.train.Saver(to_restore)
 
     with tf.Session() as sess:
         # Not needed, as checkpoint is being restored.
-        sess.run(init_op)
+        # sess.run(init_op)
 
         # Restore the checkpoint with the adapted Luminoth weights.
         saver.restore(sess, 'checkpoint/rpn')

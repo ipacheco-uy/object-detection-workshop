@@ -1,3 +1,5 @@
+import tensorflow as tf
+
 from collections import namedtuple
 
 from tensorflow.contrib import layers
@@ -42,13 +44,112 @@ def subsample(inputs, factor, scope=None):
     """
     if factor == 1:
         return inputs
-    else:
-        return layers_lib.max_pool2d(
-          inputs, [1, 1], stride=factor, scope=scope
+
+    with tf.variable_scope(scope):
+        return tf.layers.max_pooling2d(
+            inputs, [1, 1], strides=factor, padding='same'
         )
 
 
-def conv2d_same(inputs, num_outputs, kernel_size, stride, rate=1, scope=None):
+def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
+               outputs_collections=None, scope=None):
+    """Bottleneck residual unit variant with BN after convolutions.
+
+    This is the original residual unit proposed in [1]. See Fig. 1(a) of [2]
+    for its definition. Note that we use here the bottleneck variant which has
+    an extra bottleneck layer.
+
+    When putting together two consecutive ResNet blocks that use this unit, one
+    should use stride = 2 in the last unit of the first block.
+
+    Args:
+      inputs: A tensor of size [batch, height, width, channels].
+      depth: The depth of the ResNet unit output.
+      depth_bottleneck: The depth of the bottleneck layers.
+      stride: The ResNet unit's stride. Determines the amount of downsampling
+        of the units output compared to its input.
+      rate: An integer, rate for atrous convolution.
+      outputs_collections: Collection to add the ResNet unit output.
+      scope: Optional variable_scope.
+
+    Returns:
+      The ResNet unit's output.
+    """
+    with tf.variable_scope(scope, 'bottleneck_v1', [inputs]) as scope:
+        depth_in = utils.last_dimension(inputs.get_shape(), min_rank=4)
+        if depth == depth_in:
+            shortcut = subsample(inputs, stride, 'shortcut')
+        else:
+            with tf.variable_scope('shortcut'):
+                pre_shortcut = tf.layers.conv2d(
+                    inputs, depth, [1, 1], strides=stride, use_bias=False,
+                    padding='same',
+                )
+                # TODO: Make params configurable.
+                shortcut = tf.layers.batch_normalization(
+                    pre_shortcut, momentum=0.997, epsilon=1e-5, training=False
+                )
+
+        with tf.variable_scope('conv1'):
+            residual = tf.layers.conv2d(
+                inputs, depth_bottleneck, [1, 1], strides=1, use_bias=False,
+                padding='same',
+            )
+            residual = tf.layers.batch_normalization(
+                residual, momentum=0.997, epsilon=1e-5, training=False,
+            )
+            residual = tf.nn.relu(residual)
+
+        with tf.variable_scope('conv2'):
+            # TODO: Necessary?
+            residual = conv2d_same(
+                residual, depth_bottleneck, 3, strides=stride,
+                dilation_rate=rate,
+            )
+            residual = tf.layers.batch_normalization(
+                residual, momentum=0.997, epsilon=1e-5, training=False,
+            )
+            residual = tf.nn.relu(residual)
+
+        with tf.variable_scope('conv3'):
+            residual = tf.layers.conv2d(
+                residual, depth, [1, 1], strides=1, use_bias=False,
+                padding='same',
+            )
+            residual = tf.layers.batch_normalization(
+                residual, momentum=0.997, epsilon=1e-5, training=False,
+            )
+
+        output = tf.nn.relu(shortcut + residual)
+
+        return utils.collect_named_outputs(outputs_collections, scope.name, output)
+
+
+def resnet_v1_block(scope, base_depth, num_units, stride):
+    """Helper function for creating a resnet_v1 bottleneck block.
+
+    Args:
+      scope: The scope of the block.
+      base_depth: The depth of the bottleneck layer for each unit.
+      num_units: The number of units in the block.
+      stride: The stride of the block, implemented as a stride in the last
+        unit. All other units have stride=1.
+
+    Returns:
+      A resnet_v1 bottleneck block.
+    """
+    return Block(scope, bottleneck, [{
+        'depth': base_depth * 4,
+        'depth_bottleneck': base_depth,
+        'stride': 1
+     }] * (num_units - 1) + [{
+        'depth': base_depth * 4,
+        'depth_bottleneck': base_depth,
+        'stride': stride
+      }])
+
+
+def conv2d_same(inputs, filters, kernel_size, strides, dilation_rate=1):
     """Strided 2-D convolution with 'SAME' padding.
 
     When stride > 1, then we do explicit zero-padding, followed by conv2d with
@@ -75,40 +176,36 @@ def conv2d_same(inputs, num_outputs, kernel_size, stride, rate=1, scope=None):
 
     Args:
       inputs: A 4-D tensor of size [batch, height_in, width_in, channels].
-      num_outputs: An integer, the number of output filters.
+      filters: An integer, the number of output filters.
       kernel_size: An int with the kernel_size of the filters.
-      stride: An integer, the output stride.
-      rate: An integer, rate for atrous convolution.
-      scope: Scope.
+      strides: An integer, the output strides.
+      dilation_rate: An integer, rate for atrous convolution.
 
     Returns:
       output: A 4-D tensor of size [batch, height_out, width_out, channels]
         with the convolution output.
     """
-    if stride == 1:
-        return layers.conv2d(
-            inputs,
-            num_outputs,
-            kernel_size,
-            stride=1,
-            rate=rate,
-            padding='SAME',
-            scope=scope)
+    if strides == 1:
+        return tf.layers.conv2d(
+            inputs, filters, kernel_size, strides=1, use_bias=False,
+            dilation_rate=dilation_rate, padding='same',
+        )
     else:
-        kernel_size_effective = kernel_size + (kernel_size - 1) * (rate - 1)
+        kernel_size_effective = (
+            kernel_size + (kernel_size - 1) * (dilation_rate - 1)
+        )
         pad_total = kernel_size_effective - 1
         pad_beg = pad_total // 2
         pad_end = pad_total - pad_beg
         inputs = array_ops.pad(
-            inputs, [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]])
-        return layers.conv2d(
-            inputs,
-            num_outputs,
-            kernel_size,
-            stride=stride,
-            rate=rate,
-            padding='VALID',
-            scope=scope)
+            inputs, [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]]
+        )
+        return tf.layers.conv2d(
+            inputs, filters, kernel_size, strides=strides, use_bias=False,
+            dilation_rate=dilation_rate, padding='valid',
+        )
+
+###
 
 
 @add_arg_scope
@@ -238,64 +335,9 @@ def resnet_arg_scope(weight_decay=0.0001,
                 return arg_sc
 
 
-@add_arg_scope
-def bottleneck(inputs,
-               depth,
-               depth_bottleneck,
-               stride,
-               rate=1,
-               outputs_collections=None,
-               scope=None):
-    """Bottleneck residual unit variant with BN after convolutions.
-
-    This is the original residual unit proposed in [1]. See Fig. 1(a) of [2] for
-    its definition. Note that we use here the bottleneck variant which has an
-    extra bottleneck layer.
-
-    When putting together two consecutive ResNet blocks that use this unit, one
-    should use stride = 2 in the last unit of the first block.
-
-    Args:
-      inputs: A tensor of size [batch, height, width, channels].
-      depth: The depth of the ResNet unit output.
-      depth_bottleneck: The depth of the bottleneck layers.
-      stride: The ResNet unit's stride. Determines the amount of downsampling
-        of the units output compared to its input.
-      rate: An integer, rate for atrous convolution.
-      outputs_collections: Collection to add the ResNet unit output.
-      scope: Optional variable_scope.
-
-    Returns:
-      The ResNet unit's output.
-    """
-    with variable_scope.variable_scope(scope, 'bottleneck_v1', [inputs]) as sc:
-        depth_in = utils.last_dimension(inputs.get_shape(), min_rank=4)
-        if depth == depth_in:
-            shortcut = subsample(inputs, stride, 'shortcut')
-        else:
-            shortcut = layers.conv2d(
-                inputs,
-                depth, [1, 1],
-                stride=stride,
-                activation_fn=None,
-                scope='shortcut')
-
-        residual = layers.conv2d(
-            inputs, depth_bottleneck, [1, 1], stride=1, scope='conv1')
-        residual = conv2d_same(
-            residual, depth_bottleneck, 3, stride, rate=rate, scope='conv2')
-        residual = layers.conv2d(
-            residual, depth, [1, 1], stride=1, activation_fn=None, scope='conv3')
-
-        output = nn_ops.relu(shortcut + residual)
-
-        return utils.collect_named_outputs(outputs_collections, sc.name, output)
-
-
 def resnet_v1(inputs,
               blocks,
-              num_classes=None,
-              is_training=True,
+              training=True,
               global_pool=True,
               output_stride=None,
               include_root_block=True,
@@ -331,9 +373,7 @@ def resnet_v1(inputs,
       blocks: A list of length equal to the number of ResNet blocks. Each
         element is a resnet_utils.Block object describing the units in the
         block.
-      num_classes: Number of predicted classes for classification tasks. If
-        None we return the features before the logit layer.
-      is_training: whether batch_norm layers are in training mode.
+      training: whether batch_norm layers are in training mode.
       global_pool: If True, we perform global average pooling before computing
         the logits. Set to True for image classification, False for dense
         prediction.
@@ -350,10 +390,8 @@ def resnet_v1(inputs,
       net: A rank-4 tensor of size [batch, height_out, width_out, channels_out].
         If global_pool is False, then height_out and width_out are reduced by a
         factor of output_stride compared to the respective height_in and width_in,
-        else both height_out and width_out equal one. If num_classes is None, then
-        net is the output of the last ResNet block, potentially after global
-        average pooling. If num_classes is not None, net contains the pre-softmax
-        activations.
+        else both height_out and width_out equal one. `net` is the output of
+        the last ResNet block, potentially after global average pooling.
       end_points: A dictionary from components of the network to the corresponding
         activation.
 
@@ -361,85 +399,62 @@ def resnet_v1(inputs,
       ValueError: If the target output_stride is not valid.
     """
     with variable_scope.variable_scope(scope, 'resnet_v1', [inputs], reuse=reuse) as sc:
-        end_points_collection = sc.original_name_scope + '_end_points'
+        endpoints_collection = sc.original_name_scope + '_endpoints'
         with arg_scope(
-                [layers.conv2d, bottleneck, stack_blocks_dense],
-                outputs_collections=end_points_collection):
-            with arg_scope([layers.batch_norm], is_training=is_training):
+                [layers.conv2d, stack_blocks_dense],
+                outputs_collections=endpoints_collection):
+
+            with arg_scope([layers.batch_norm], training=training):
                 net = inputs
+
                 if include_root_block:
                     if output_stride is not None:
                         if output_stride % 4 != 0:
                             raise ValueError('The output_stride needs to be a multiple of 4.')
                         output_stride /= 4
-                    net = conv2d_same(net, 64, 7, stride=2, scope='conv1')
-                    net = layers_lib.max_pool2d(net, [3, 3], stride=2, scope='pool1')
+
+                    with tf.variable_scope('conv1'):
+                        net = conv2d_same(net, 64, 7, strides=2)
+                        net = tf.layers.batch_normalization(
+                            net, momentum=0.997, epsilon=1e-5, training=False,
+                        )
+                        net = tf.nn.relu(net)
+
+                    with tf.variable_scope('pool1'):
+                        net = tf.layers.max_pooling2d(net, [3, 3], strides=2)
+
                 net = stack_blocks_dense(net, blocks, output_stride)
+
                 if global_pool:
                     # Global average pooling.
                     net = math_ops.reduce_mean(net, [1, 2], name='pool5', keepdims=True)
-                if num_classes is not None:
-                    net = layers.conv2d(
-                        net,
-                        num_classes, [1, 1],
-                        activation_fn=None,
-                        normalizer_fn=None,
-                        scope='logits')
-                # Convert end_points_collection into a dictionary of end_points.
-                end_points = utils.convert_collection_to_dict(end_points_collection)
-                if num_classes is not None:
-                    end_points['predictions'] = layers_lib.softmax(
-                        net, scope='predictions')
+
+                # Convert endpoints_collection into a dictionary of end_points.
+                end_points = utils.convert_collection_to_dict(endpoints_collection)
+
                 return net, end_points
+
 
 resnet_v1.default_image_size = 224
 
 
-def resnet_v1_block(scope, base_depth, num_units, stride):
-    """Helper function for creating a resnet_v1 bottleneck block.
+def resnet_v1_101(inputs, training=True, global_pool=True,
+                  output_stride=None, reuse=None, scope='resnet_v1_101'):
 
-    Args:
-      scope: The scope of the block.
-      base_depth: The depth of the bottleneck layer for each unit.
-      num_units: The number of units in the block.
-      stride: The stride of the block, implemented as a stride in the last unit.
-        All other units have stride=1.
-
-    Returns:
-      A resnet_v1 bottleneck block.
-    """
-    return Block(scope, bottleneck, [{
-        'depth': base_depth * 4,
-        'depth_bottleneck': base_depth,
-        'stride': 1
-     }] * (num_units - 1) + [{
-        'depth': base_depth * 4,
-        'depth_bottleneck': base_depth,
-        'stride': stride
-      }])
-
-
-def resnet_v1_101(inputs,
-                  num_classes=None,
-                  is_training=True,
-                  global_pool=True,
-                  output_stride=None,
-                  reuse=None,
-                  scope='resnet_v1_101'):
-    """ResNet-101 model of [1]. See resnet_v1() for arg and return description."""
     blocks = [
         resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
         resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
         resnet_v1_block('block3', base_depth=256, num_units=23, stride=2),
         resnet_v1_block('block4', base_depth=512, num_units=3, stride=1),
     ]
+
     return resnet_v1(
         inputs,
         blocks,
-        num_classes,
-        is_training,
+        training,
         global_pool,
         output_stride,
         include_root_block=True,
         reuse=reuse,
-        scope=scope)
+        scope=scope,
+    )
