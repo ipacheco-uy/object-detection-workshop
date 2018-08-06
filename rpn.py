@@ -1,11 +1,11 @@
 import click
 import numpy as np
 import tensorflow as tf
+import tensorflow.contrib.eager as tfe
 
 from PIL import Image, ImageDraw
-from tensorflow.contrib.framework.python.ops import arg_scope
 
-from resnet import resnet_v1_101, resnet_arg_scope
+from resnet import resnet_v1_101
 
 
 _R_MEAN = 123.68
@@ -319,17 +319,15 @@ def apply_nms(proposals, scores):
 def build_base_network(inputs):
     """Obtain the feature map for an input image."""
     # Pre-process inputs as required by the Resnet (just substracting means).
-    processed_inputs = inputs - [_R_MEAN, _G_MEAN, _B_MEAN]
+    means = tf.constant([_R_MEAN, _G_MEAN, _B_MEAN], dtype=tf.float32)
+    processed_inputs = inputs - means
 
-    # Initialize TF Slim's Resnet implementation, using its arg_scope in order
-    # to get batchnorm into the model. TODO: Why isn't it added if not?
-    with arg_scope(resnet_arg_scope()):
-        _, endpoints = resnet_v1_101(
-            processed_inputs,
-            training=False,
-            global_pool=False,
-            output_stride=OUTPUT_STRIDE,
-        )
+    _, endpoints = resnet_v1_101(
+        processed_inputs,
+        training=False,
+        global_pool=False,
+        output_stride=OUTPUT_STRIDE,
+    )
 
     feature_map = endpoints['resnet_v1_101/block3']
 
@@ -417,68 +415,9 @@ def main(image_path):
     raw_image = Image.open(image_path)
     image = np.expand_dims(raw_image.convert('RGB'), axis=0)
 
-    inputs = tf.placeholder(tf.float32, shape=[None, None, None, 3])
-    model = build_model(inputs)
-
-    init_op = tf.group(
-        tf.global_variables_initializer(),
-        tf.local_variables_initializer()
-    )
-
-    to_restore = {}
-    pretrained_vars = tf.get_collection(
-        tf.GraphKeys.GLOBAL_VARIABLES,
-        scope='resnet_v1_101'
-    )
-    for var in pretrained_vars:
-        if 'batch_normalization' in var.op.name:
-            new_name = var.op.name.replace(
-                'batch_normalization',
-                'BatchNorm',
-            )
-            to_restore[new_name] = var
-            print(new_name, '=>', var.op.name)
-        elif 'conv2d' in var.op.name:
-            new_name = var.op.name.replace(
-                'conv2d/kernel',
-                'weights',
-            )
-            to_restore[new_name] = var
-            print(new_name, '=>', var.op.name)
-        else:
-            to_restore[var.op.name] = var
-        # if 'shortcut/batch_normalization' in var.op.name:
-        #     new_name = var.op.name.replace(
-        #         'shortcut/batch_normalization',
-        #         'shortcut/BatchNorm',
-        #     )
-        #     to_restore[new_name] = var
-        #     print(new_name, '=>', var.op.name)
-        # elif 'shortcut/conv2d' in var.op.name:
-        #     new_name = var.op.name.replace(
-        #         'shortcut/conv2d/kernel',
-        #         'shortcut/weights',
-        #     )
-        #     to_restore[new_name] = var
-        #     print(new_name, '=>', var.op.name)
-
-    rpn_vars = tf.get_collection(
-        tf.GraphKeys.GLOBAL_VARIABLES,
-        scope='rpn'
-    )
-    for var in rpn_vars:
-        to_restore[var.op.name] = var
-
-    saver = tf.train.Saver(to_restore)
-
-    with tf.Session() as sess:
-        # Not needed, as checkpoint is being restored.
-        # sess.run(init_op)
-
-        # Restore the checkpoint with the adapted Luminoth weights.
-        saver.restore(sess, 'checkpoint/rpn')
-
-        result = sess.run(model, feed_dict={inputs: image})
+    tf.enable_eager_execution()
+    with tfe.restore_variables_on_create('checkpoint/rpn'):
+        result = build_model(image)
 
     draw_bboxes(raw_image, result['proposals'][:10])
     raw_image.save('out.png')

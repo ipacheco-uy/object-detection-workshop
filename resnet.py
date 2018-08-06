@@ -2,18 +2,15 @@ import tensorflow as tf
 
 from collections import namedtuple
 
-from tensorflow.contrib import layers
 from tensorflow.contrib.framework.python.ops import add_arg_scope
 from tensorflow.contrib.framework.python.ops import arg_scope
-from tensorflow.contrib.layers.python.layers import initializers
-from tensorflow.contrib.layers.python.layers import layers as layers_lib
-from tensorflow.contrib.layers.python.layers import regularizers
 from tensorflow.contrib.layers.python.layers import utils
-from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import variable_scope
+
+
+ENDPOINTS_COLLECTION = 'resnet_v1_endpoints'
 
 
 class Block(namedtuple('Block', ['scope', 'unit_fn', 'args'])):
@@ -85,9 +82,10 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
                     inputs, depth, [1, 1], strides=stride, use_bias=False,
                     padding='same',
                 )
-                # TODO: Make params configurable.
+                # TODO: Make params configurable. Here and everywhere.
                 shortcut = tf.layers.batch_normalization(
-                    pre_shortcut, momentum=0.997, epsilon=1e-5, training=False
+                    pre_shortcut, momentum=0.997, epsilon=1e-5, training=False,
+                    fused=False
                 )
 
         with tf.variable_scope('conv1'):
@@ -97,6 +95,7 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
             )
             residual = tf.layers.batch_normalization(
                 residual, momentum=0.997, epsilon=1e-5, training=False,
+                fused=False
             )
             residual = tf.nn.relu(residual)
 
@@ -108,6 +107,7 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
             )
             residual = tf.layers.batch_normalization(
                 residual, momentum=0.997, epsilon=1e-5, training=False,
+                fused=False
             )
             residual = tf.nn.relu(residual)
 
@@ -118,11 +118,12 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
             )
             residual = tf.layers.batch_normalization(
                 residual, momentum=0.997, epsilon=1e-5, training=False,
+                fused=False
             )
 
         output = tf.nn.relu(shortcut + residual)
 
-        return utils.collect_named_outputs(outputs_collections, scope.name, output)
+        return output
 
 
 def resnet_v1_block(scope, base_depth, num_units, stride):
@@ -251,16 +252,18 @@ def stack_blocks_dense(net,
       ValueError: If the target output_stride is not valid.
     """
     # The current_stride variable keeps track of the effective stride of the
-    # activations. This allows us to invoke atrous convolution whenever applying
-    # the next residual unit would result in the activations having stride larger
-    # than the target output_stride.
+    # activations. This allows us to invoke atrous convolution whenever
+    # applying the next residual unit would result in the activations having
+    # stride larger than the target output_stride.
     current_stride = 1
 
     # The atrous convolution rate parameter.
     rate = 1
 
+    endpoints_collection = {}
+
     for block in blocks:
-        with variable_scope.variable_scope(block.scope, 'block', [net]) as sc:
+        with variable_scope.variable_scope(block.scope, 'block', [net]) as scope:
             for i, unit in enumerate(block.args):
                 if output_stride is not None and current_stride > output_stride:
                     raise ValueError('The target output_stride cannot be reached.')
@@ -277,71 +280,18 @@ def stack_blocks_dense(net,
                     else:
                         net = block.unit_fn(net, rate=1, **unit)
                         current_stride *= unit.get('stride', 1)
-            net = utils.collect_named_outputs(outputs_collections, sc.name, net)
+
+            # Add output of each block to the endpoints collection.
+            endpoints_collection[scope.name] = net
 
     if output_stride is not None and current_stride != output_stride:
         raise ValueError('The target output_stride cannot be reached.')
 
-    return net
+    return net, endpoints_collection
 
 
-def resnet_arg_scope(weight_decay=0.0001,
-                     batch_norm_decay=0.997,
-                     batch_norm_epsilon=1e-5,
-                     batch_norm_scale=True):
-    """Defines the default ResNet arg scope.
-
-    TODO(gpapan): The batch-normalization related default values above are
-      appropriate for use in conjunction with the reference ResNet models
-      released at https://github.com/KaimingHe/deep-residual-networks. When
-      training ResNets from scratch, they might need to be tuned.
-
-    Args:
-      weight_decay: The weight decay to use for regularizing the model.
-      batch_norm_decay: The moving average decay when estimating layer
-        activation statistics in batch normalization.
-      batch_norm_epsilon: Small constant to prevent division by zero when
-        normalizing activations by their variance in batch normalization.
-      batch_norm_scale: If True, uses an explicit `gamma` multiplier to scale
-        the activations in the batch normalization layer.
-
-    Returns:
-      An `arg_scope` to use for the resnet models.
-    """
-    batch_norm_params = {
-        'decay': batch_norm_decay,
-        'epsilon': batch_norm_epsilon,
-        'scale': batch_norm_scale,
-        'updates_collections': ops.GraphKeys.UPDATE_OPS,
-     }
-
-    with arg_scope(
-          [layers.conv2d],
-          weights_regularizer=regularizers.l2_regularizer(weight_decay),
-          weights_initializer=initializers.variance_scaling_initializer(),
-          activation_fn=nn_ops.relu,
-          normalizer_fn=layers_lib.batch_norm,
-          normalizer_params=batch_norm_params):
-        with arg_scope([layers_lib.batch_norm], **batch_norm_params):
-            # The following implies padding='SAME' for pool1, which makes
-            # feature alignment easier for dense prediction tasks. This is also
-            # used in https://github.com/facebook/fb.resnet.torch. However the
-            # accompanying code of 'Deep Residual Learning for Image
-            # Recognition' uses padding='VALID' for pool1. You can switch to
-            # that choice by setting
-            # tf.contrib.framework.arg_scope([tf.contrib.layers.max_pool2d],
-            # padding='VALID').
-            with arg_scope([layers_lib.max_pool2d], padding='SAME') as arg_sc:
-                return arg_sc
-
-
-def resnet_v1(inputs,
-              blocks,
-              training=True,
-              global_pool=True,
-              output_stride=None,
-              include_root_block=True,
-              reuse=None,
+def resnet_v1(inputs, blocks, training=True, global_pool=True,
+              output_stride=None, include_root_block=True, reuse=None,
               scope=None):
     """Generator for v1 ResNet models.
 
@@ -400,39 +350,37 @@ def resnet_v1(inputs,
     """
     with variable_scope.variable_scope(scope, 'resnet_v1', [inputs], reuse=reuse) as sc:
         endpoints_collection = sc.original_name_scope + '_endpoints'
+        # TODO: Remove.
         with arg_scope(
-                [layers.conv2d, stack_blocks_dense],
+                [stack_blocks_dense],
                 outputs_collections=endpoints_collection):
 
-            with arg_scope([layers.batch_norm], training=training):
-                net = inputs
+            net = inputs
 
-                if include_root_block:
-                    if output_stride is not None:
-                        if output_stride % 4 != 0:
-                            raise ValueError('The output_stride needs to be a multiple of 4.')
-                        output_stride /= 4
+            if include_root_block:
+                if output_stride is not None:
+                    if output_stride % 4 != 0:
+                        raise ValueError('The output_stride needs to be a multiple of 4.')
+                    output_stride /= 4
 
-                    with tf.variable_scope('conv1'):
-                        net = conv2d_same(net, 64, 7, strides=2)
-                        net = tf.layers.batch_normalization(
-                            net, momentum=0.997, epsilon=1e-5, training=False,
-                        )
-                        net = tf.nn.relu(net)
+                with tf.variable_scope('conv1'):
+                    net = conv2d_same(net, 64, 7, strides=2)
+                    net = tf.layers.batch_normalization(
+                        net, momentum=0.997, epsilon=1e-5, training=False,
+                        fused=False
+                    )
+                    net = tf.nn.relu(net)
 
-                    with tf.variable_scope('pool1'):
-                        net = tf.layers.max_pooling2d(net, [3, 3], strides=2)
+                with tf.variable_scope('pool1'):
+                    net = tf.layers.max_pooling2d(net, [3, 3], strides=2)
 
-                net = stack_blocks_dense(net, blocks, output_stride)
+            net, endpoints = stack_blocks_dense(net, blocks, output_stride)
 
-                if global_pool:
-                    # Global average pooling.
-                    net = math_ops.reduce_mean(net, [1, 2], name='pool5', keepdims=True)
+            if global_pool:
+                # Global average pooling.
+                net = math_ops.reduce_mean(net, [1, 2], name='pool5', keepdims=True)
 
-                # Convert endpoints_collection into a dictionary of end_points.
-                end_points = utils.convert_collection_to_dict(endpoints_collection)
-
-                return net, end_points
+            return net, endpoints
 
 
 resnet_v1.default_image_size = 224
