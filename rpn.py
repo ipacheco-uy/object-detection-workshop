@@ -24,7 +24,6 @@ NMS_THRESHOLD = 0.7
 
 
 def draw_rectangle(draw, coordinates, color, width=1):
-    # fill = tuple(color + [40])
     outline = tuple(color + [255])
 
     for i in range(width):
@@ -35,7 +34,6 @@ def draw_rectangle(draw, coordinates, color, width=1):
             coordinates[3] + i,
         ]
         if i == 0:
-            # draw.rectangle(coords, fill=fill, outline=outline)
             draw.rectangle(coords, outline=outline)
         else:
             draw.rectangle(coords, outline=outline)

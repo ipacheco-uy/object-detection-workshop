@@ -2,16 +2,6 @@ import tensorflow as tf
 
 from collections import namedtuple
 
-from tensorflow.contrib.framework.python.ops import add_arg_scope
-from tensorflow.contrib.framework.python.ops import arg_scope
-from tensorflow.contrib.layers.python.layers import utils
-from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import variable_scope
-
-
-ENDPOINTS_COLLECTION = 'resnet_v1_endpoints'
-
 
 class Block(namedtuple('Block', ['scope', 'unit_fn', 'args'])):
     """A named tuple describing a ResNet block.
@@ -73,7 +63,7 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
       The ResNet unit's output.
     """
     with tf.variable_scope(scope, 'bottleneck_v1', [inputs]) as scope:
-        depth_in = utils.last_dimension(inputs.get_shape(), min_rank=4)
+        depth_in = inputs.get_shape()[-1].value
         if depth == depth_in:
             shortcut = subsample(inputs, stride, 'shortcut')
         else:
@@ -198,7 +188,7 @@ def conv2d_same(inputs, filters, kernel_size, strides, dilation_rate=1):
         pad_total = kernel_size_effective - 1
         pad_beg = pad_total // 2
         pad_end = pad_total - pad_beg
-        inputs = array_ops.pad(
+        inputs = tf.pad(
             inputs, [[0, 0], [pad_beg, pad_end], [pad_beg, pad_end], [0, 0]]
         )
         return tf.layers.conv2d(
@@ -206,29 +196,23 @@ def conv2d_same(inputs, filters, kernel_size, strides, dilation_rate=1):
             dilation_rate=dilation_rate, padding='valid',
         )
 
-###
 
-
-@add_arg_scope
-def stack_blocks_dense(net,
-                       blocks,
-                       output_stride=None,
-                       outputs_collections=None):
+def stack_blocks_dense(net, blocks, output_stride=None):
     """Stacks ResNet `Blocks` and controls output feature density.
 
     First, this function creates scopes for the ResNet in the form of
     'block_name/unit_1', 'block_name/unit_2', etc.
 
     Second, this function allows the user to explicitly control the ResNet
-    output_stride, which is the ratio of the input to output spatial resolution.
-    This is useful for dense prediction tasks such as semantic segmentation or
-    object detection.
+    output_stride, which is the ratio of the input to output spatial
+    resolution.  This is useful for dense prediction tasks such as semantic
+    segmentation or object detection.
 
     Most ResNets consist of 4 ResNet blocks and subsample the activations by a
-    factor of 2 when transitioning between consecutive ResNet blocks. This results
-    to a nominal ResNet output_stride equal to 8. If we set the output_stride to
-    half the nominal network stride (e.g., output_stride=4), then we compute
-    responses twice.
+    factor of 2 when transitioning between consecutive ResNet blocks. This
+    results to a nominal ResNet output_stride equal to 8. If we set the
+    output_stride to half the nominal network stride (e.g., output_stride=4),
+    then we compute responses twice.
 
     Control of the output feature density is implemented by atrous convolution.
 
@@ -237,16 +221,17 @@ def stack_blocks_dense(net,
       blocks: A list of length equal to the number of ResNet `Blocks`. Each
         element is a ResNet `Block` object describing the units in the `Block`.
       output_stride: If `None`, then the output will be computed at the nominal
-        network stride. If output_stride is not `None`, it specifies the requested
-        ratio of input to output spatial resolution, which needs to be equal to
-        the product of unit strides from the start up to some level of the ResNet.
-        For example, if the ResNet employs units with strides 1, 2, 1, 3, 4, 1,
-        then valid values for the output_stride are 1, 2, 6, 24 or None (which
-        is equivalent to output_stride=24).
-      outputs_collections: Collection to add the ResNet block outputs.
+        network stride. If output_stride is not `None`, it specifies the
+        requested ratio of input to output spatial resolution, which needs to
+        be equal to the product of unit strides from the start up to some level
+        of the ResNet.  For example, if the ResNet employs units with strides
+        1, 2, 1, 3, 4, 1, then valid values for the output_stride are 1, 2, 6,
+        24 or None (which is equivalent to output_stride=24).
 
     Returns:
       net: Output tensor with stride equal to the specified output_stride.
+      endpoints: A dictionary from components of the network to the
+        corresponding activation.
 
     Raises:
       ValueError: If the target output_stride is not valid.
@@ -263,18 +248,24 @@ def stack_blocks_dense(net,
     endpoints_collection = {}
 
     for block in blocks:
-        with variable_scope.variable_scope(block.scope, 'block', [net]) as scope:
+        with tf.variable_scope(block.scope, 'block', [net]) as scope:
             for i, unit in enumerate(block.args):
-                if output_stride is not None and current_stride > output_stride:
-                    raise ValueError('The target output_stride cannot be reached.')
+                if (output_stride is not None
+                        and current_stride > output_stride):
+                    raise ValueError(
+                        'The target output_stride cannot be reached.'
+                    )
 
-                with variable_scope.variable_scope('unit_%d' % (i + 1), values=[net]):
+                with tf.variable_scope('unit_%d' % (i + 1), values=[net]):
                     # If we have reached the target output_stride, then we need
                     # to employ atrous convolution with stride=1 and multiply
                     # the atrous rate by the current unit's stride for use in
                     # subsequent layers.
-                    if output_stride is not None and current_stride == output_stride:
-                        net = block.unit_fn(net, rate=rate, **dict(unit, stride=1))
+                    if (output_stride is not None
+                            and current_stride == output_stride):
+                        net = block.unit_fn(
+                            net, rate=rate, **dict(unit, stride=1)
+                        )
                         rate *= unit.get('stride', 1)
 
                     else:
@@ -337,50 +328,49 @@ def resnet_v1(inputs, blocks, training=True, global_pool=True,
       scope: Optional variable_scope.
 
     Returns:
-      net: A rank-4 tensor of size [batch, height_out, width_out, channels_out].
-        If global_pool is False, then height_out and width_out are reduced by a
-        factor of output_stride compared to the respective height_in and width_in,
-        else both height_out and width_out equal one. `net` is the output of
-        the last ResNet block, potentially after global average pooling.
-      end_points: A dictionary from components of the network to the corresponding
-        activation.
+      net: A rank-4 tensor of size [batch, height_out, width_out,
+        channels_out].  If global_pool is False, then height_out and width_out
+        are reduced by a factor of output_stride compared to the respective
+        height_in and width_in, else both height_out and width_out equal
+        one. `net` is the output of the last ResNet block, potentially after
+        global average pooling.
+      endpoints: A dictionary from components of the network to the
+        corresponding activation.
 
     Raises:
       ValueError: If the target output_stride is not valid.
     """
-    with variable_scope.variable_scope(scope, 'resnet_v1', [inputs], reuse=reuse) as sc:
-        endpoints_collection = sc.original_name_scope + '_endpoints'
-        # TODO: Remove.
-        with arg_scope(
-                [stack_blocks_dense],
-                outputs_collections=endpoints_collection):
+    with tf.variable_scope(scope, 'resnet_v1', [inputs], reuse=reuse):
+        net = inputs
 
-            net = inputs
-
-            if include_root_block:
-                if output_stride is not None:
-                    if output_stride % 4 != 0:
-                        raise ValueError('The output_stride needs to be a multiple of 4.')
-                    output_stride /= 4
-
-                with tf.variable_scope('conv1'):
-                    net = conv2d_same(net, 64, 7, strides=2)
-                    net = tf.layers.batch_normalization(
-                        net, momentum=0.997, epsilon=1e-5, training=False,
-                        fused=False
+        if include_root_block:
+            if output_stride is not None:
+                if output_stride % 4 != 0:
+                    raise ValueError(
+                        'The output_stride needs to be a multiple of 4.'
                     )
-                    net = tf.nn.relu(net)
+                output_stride /= 4
 
-                with tf.variable_scope('pool1'):
-                    net = tf.layers.max_pooling2d(net, [3, 3], strides=2)
+            with tf.variable_scope('conv1'):
+                net = conv2d_same(net, 64, 7, strides=2)
+                net = tf.layers.batch_normalization(
+                    net, momentum=0.997, epsilon=1e-5, training=False,
+                    fused=False
+                )
+                net = tf.nn.relu(net)
 
-            net, endpoints = stack_blocks_dense(net, blocks, output_stride)
+            with tf.variable_scope('pool1'):
+                net = tf.layers.max_pooling2d(net, [3, 3], strides=2)
 
-            if global_pool:
-                # Global average pooling.
-                net = math_ops.reduce_mean(net, [1, 2], name='pool5', keepdims=True)
+        net, endpoints = stack_blocks_dense(net, blocks, output_stride)
 
-            return net, endpoints
+        if global_pool:
+            # Global average pooling.
+            net = tf.reduce_mean(
+                net, [1, 2], name='pool5', keepdims=True
+            )
+
+        return net, endpoints
 
 
 resnet_v1.default_image_size = 224
