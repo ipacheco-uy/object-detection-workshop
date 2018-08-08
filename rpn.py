@@ -1,5 +1,6 @@
 import click
 import numpy as np
+import os
 import tensorflow as tf
 import tensorflow.contrib.eager as tfe
 
@@ -23,6 +24,17 @@ POST_NMS_TOP_N = 2000
 NMS_THRESHOLD = 0.7
 
 
+def open_image(path):
+    path = os.path.expanduser(path)
+    raw_image = Image.open(path)
+    image = np.expand_dims(raw_image.convert('RGB'), axis=0)
+    return image
+
+
+def to_image(image_array):
+    return Image.fromarray(np.squeeze(image_array, axis=0))
+
+
 def draw_rectangle(draw, coordinates, color, width=1):
     outline = tuple(color + [255])
 
@@ -39,12 +51,18 @@ def draw_rectangle(draw, coordinates, color, width=1):
             draw.rectangle(coords, outline=outline)
 
 
-def draw_bboxes(image, objects):
+def draw_bboxes(image_array, objects):
+    # Receives a numpy array. Translate into a PIL image.
+    # TODO: Make optional, or more robust.
+    image = to_image(image_array)
+
     # Open as 'RGBA' in order to draw translucent boxes.
     draw = ImageDraw.Draw(image, 'RGBA')
     for obj in objects:
         color = [255, 0, 0]
         draw_rectangle(draw, obj, color, width=2)
+
+    return image
 
 
 def get_width_upright(bboxes):
@@ -316,6 +334,7 @@ def apply_nms(proposals, scores):
 
 def build_base_network(inputs):
     """Obtain the feature map for an input image."""
+    # TODO: Not "building" anymore, change name.
     # Pre-process inputs as required by the Resnet (just substracting means).
     means = tf.constant([_R_MEAN, _G_MEAN, _B_MEAN], dtype=tf.float32)
     processed_inputs = inputs - means
