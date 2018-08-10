@@ -379,6 +379,7 @@ resnet_v1.default_image_size = 224
 def resnet_v1_101(inputs, training=True, global_pool=True,
                   output_stride=None, reuse=None, scope='resnet_v1_101'):
 
+    # TODO: Can we not build the block 4?
     blocks = [
         resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
         resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
@@ -395,4 +396,15 @@ def resnet_v1_101(inputs, training=True, global_pool=True,
         include_root_block=True,
         reuse=reuse,
         scope=scope,
+    )
+
+
+def resnet_v1_101_tail(inputs, scope='resnet_v1_101'):
+    blocks = [
+        resnet_v1_block('block4', base_depth=512, num_units=3, stride=1),
+    ]
+
+    return resnet_v1(
+        inputs, blocks, global_pool=False, training=False,
+        include_root_block=False, scope=scope,
     )

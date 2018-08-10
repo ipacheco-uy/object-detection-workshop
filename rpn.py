@@ -6,7 +6,7 @@ import tensorflow.contrib.eager as tfe
 
 from PIL import Image, ImageDraw
 
-from resnet import resnet_v1_101
+from resnet import resnet_v1_101, resnet_v1_101_tail
 
 
 _R_MEAN = 123.68
@@ -390,7 +390,25 @@ def build_rpn(feature_map):
     return rpn_bbox_pred, rpn_cls_prob
 
 
-def build_model(inputs):
+def build_rcnn(features, num_classes):
+    rcnn_cls_score = tf.layers.dense(
+        features,
+        num_classes + 1,
+        name='rcnn/fc_classifier',
+    )
+
+    rcnn_cls_prob = tf.nn.softmax(rcnn_cls_score)
+
+    rcnn_bbox = tf.layers.dense(
+        features,
+        num_classes * 4,
+        name='rcnn/fc_bbox',
+    )
+
+    return rcnn_bbox, rcnn_cls_prob
+
+
+def build_model(inputs, num_classes):
     """Build the whole model.
 
     Args:
@@ -420,10 +438,85 @@ def build_model(inputs):
     # Apply non-maximum suppression to proposals.
     proposals, scores = apply_nms(proposals, scores)
 
-    return {
-        'proposals': proposals,
-        'scores': scores,
-    }
+    # RoI pooling.
+    im_shape = inputs.shape[1:3]
+    pooled = roi_pooling(feature_map, proposals, im_shape)
+
+    # Apply the tail of the base network.
+    features = resnet_v1_101_tail(pooled)[0]
+    features = tf.reduce_mean(features, [1, 2])
+
+    # Build the R-CNN.
+    bbox_pred, cls_prob = build_rcnn(features, num_classes)
+
+    # Proposals.
+
+    return bbox_pred
+
+
+def normalize_bboxes(proposals, im_shape):
+    """
+    Gets normalized coordinates for RoIs (between 0 and 1 for cropping)
+    in TensorFlow's order (y1, x1, y2, x2).
+
+    Args:
+        roi_proposals: A Tensor with the bounding boxes of shape
+            (total_proposals, 4), where the values for each proposal are
+            (x_min, y_min, x_max, y_max).
+        im_shape: A Tensor with the shape of the image (height, width).
+
+    Returns:
+        bboxes: A Tensor with normalized bounding boxes in TensorFlow's
+            format order. Its should is (total_proposals, 4).
+    """
+    with tf.name_scope('normalize_bboxes'):
+        im_shape = tf.cast(im_shape, tf.float32)
+
+        x1, y1, x2, y2 = tf.unstack(
+            proposals, axis=1
+        )
+
+        x1 = x1 / im_shape[1]
+        y1 = y1 / im_shape[0]
+        x2 = x2 / im_shape[1]
+        y2 = y2 / im_shape[0]
+
+        bboxes = tf.stack([y1, x1, y2, x2], axis=1)
+
+        return bboxes
+
+
+def roi_pooling(feature_map, proposals, im_shape):
+    """Perform RoI pooling.
+
+    This is a simplified method than what's done in the paper that obtains
+    similar results. We crop the proposal over the feature map and resize it
+    bilinearly.
+    """
+    ROI_POOL_WIDTH = 7
+    ROI_POOL_HEIGHT = 7
+
+    # Get normalized bounding boxes.
+    bboxes = normalize_bboxes(proposals, im_shape)
+    bboxes_shape = tf.shape(bboxes)
+
+    # Generate fake batch ids: since we're using a batch size of one, all the
+    # `ids` for the bounding boxes are zero.
+    batch_ids = tf.zeros((bboxes_shape[0], ), dtype=tf.int32)
+
+    # Apply crop and resize with extracting a crop double the desired size.
+    crops = tf.image.crop_and_resize(
+        feature_map, bboxes, batch_ids,
+        [ROI_POOL_WIDTH * 2, ROI_POOL_HEIGHT * 2], name='crops'
+    )
+
+    # Applies max pool with [2,2] kernel to reduce the crops to half the
+    # size, and thus having the desired output.
+    pooled = tf.nn.max_pool(
+        crops, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='VALID'
+    )
+
+    return pooled
 
 
 @click.command()
@@ -432,11 +525,13 @@ def main(image_path):
     raw_image = Image.open(image_path)
     image = np.expand_dims(raw_image.convert('RGB'), axis=0)
 
-    tf.enable_eager_execution()
-    with tfe.restore_variables_on_create('checkpoint/rpn'):
-        result = build_model(image)
+    NUM_CLASSES = 80
 
-    draw_bboxes(raw_image, result['proposals'][:10])
+    tf.enable_eager_execution()
+    with tfe.restore_variables_on_create('checkpoint/fasterrcnn'):
+        result = build_model(image, NUM_CLASSES)
+
+    draw_bboxes(raw_image, result[:10])
     raw_image.save('out.png')
 
 
