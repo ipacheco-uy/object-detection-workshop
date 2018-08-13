@@ -4,7 +4,7 @@ import os
 import tensorflow as tf
 import tensorflow.contrib.eager as tfe
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from resnet import resnet_v1_101, resnet_v1_101_tail
 
@@ -22,6 +22,9 @@ OUTPUT_STRIDE = 16
 PRE_NMS_TOP_N = 12000
 POST_NMS_TOP_N = 2000
 NMS_THRESHOLD = 0.7
+
+CLASS_NMS_THRESHOLD = 0.5
+TOTAL_MAX_DETECTIONS = 300
 
 
 def open_image(path):
@@ -63,6 +66,71 @@ def draw_bboxes(image_array, objects):
         draw_rectangle(draw, obj, color, width=2)
 
     return image
+
+
+def draw_bboxes_with_labels(image_array, classes, objects, labels):
+    # Receives a numpy array. Translate into a PIL image.
+    # TODO: Make optional, or more robust.
+    image = to_image(image_array)
+
+    # Open as 'RGBA' in order to draw translucent boxes.
+    draw = ImageDraw.Draw(image, 'RGBA')
+    for obj, label in zip(objects, labels):
+        color = [255, 0, 0]
+        draw_rectangle(draw, obj, color, width=3)
+
+        # Draw the object's label.
+        font = ImageFont.truetype(
+            # TODO: Make this OS-agnostic.
+            '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf', 14
+        )
+
+        text = classes[label]
+        label_w, label_h = font.getsize(text)
+        background_coords = [
+            obj[0] + 1,
+            obj[1],
+            obj[0] + label_w + 2,
+            obj[1] + label_h + 3,
+        ]
+        draw.rectangle(background_coords, fill=tuple(color + [255]))
+
+        draw.text(obj[:2], text, font=font)
+
+    return image
+
+
+def clip_boxes(bboxes, imshape):
+    """
+    Clips bounding boxes to image boundaries based on image shape.
+
+    Args:
+        bboxes: Tensor with shape (num_bboxes, 4)
+            where point order is x1, y1, x2, y2.
+
+        imshape: Tensor with shape (2, )
+            where the first value is height and the next is width.
+
+    Returns
+        Tensor with same shape as bboxes but making sure that none
+        of the bboxes are outside the image.
+    """
+    with tf.name_scope('BoundingBoxTransform/clip_bboxes'):
+        bboxes = tf.cast(bboxes, dtype=tf.float32)
+        imshape = tf.cast(imshape, dtype=tf.float32)
+
+        x1, y1, x2, y2 = tf.split(bboxes, 4, axis=1)
+        width = imshape[1]
+        height = imshape[0]
+        x1 = tf.maximum(tf.minimum(x1, width - 1.0), 0.0)
+        x2 = tf.maximum(tf.minimum(x2, width - 1.0), 0.0)
+
+        y1 = tf.maximum(tf.minimum(y1, height - 1.0), 0.0)
+        y2 = tf.maximum(tf.minimum(y2, height - 1.0), 0.0)
+
+        bboxes = tf.concat([x1, y1, x2, y2], axis=1)
+
+        return bboxes
 
 
 def get_width_upright(bboxes):
@@ -332,6 +400,121 @@ def apply_nms(proposals, scores):
     return proposals, scores
 
 
+def rcnn_proposals(proposals, bbox_pred, cls_prob, im_shape, num_classes,
+                   min_prob_threshold=0.0, class_max_detections=100):
+    """
+    Args:
+        proposals: Tensor with the RPN proposals bounding boxes.
+            Shape (num_proposals, 4). Where num_proposals is less than
+            POST_NMS_TOP_N (We don't know exactly beforehand)
+        bbox_pred: Tensor with the RCNN delta predictions for each proposal
+            for each class. Shape (num_proposals, 4 * num_classes)
+        cls_prob: A softmax probability for each proposal where the idx = 0
+            is the background class (which we should ignore).
+            Shape (num_proposals, num_classes + 1)
+
+    Returns:
+        objects:
+            Shape (final_num_proposals, 4)
+            Where final_num_proposals is unknown before-hand (it depends on
+            NMS). The 4-length Tensor for each corresponds to:
+            (x_min, y_min, x_max, y_max).
+        objects_label:
+            Shape (final_num_proposals,)
+        objects_label_prob:
+            Shape (final_num_proposals,)
+
+    """
+    selected_boxes = []
+    selected_probs = []
+    selected_labels = []
+
+    TARGET_VARIANCES = np.array([0.1, 0.1, 0.2, 0.2])
+
+    # For each class, take the proposals with the class-specific
+    # predictions (class scores and bbox regression) and filter accordingly
+    # (valid area, min probability score and NMS).
+    for class_id in range(num_classes):
+        # Apply the class-specific transformations to the proposals to
+        # obtain the current class' prediction.
+        class_prob = cls_prob[:, class_id + 1]  # 0 is background class.
+        class_bboxes = bbox_pred[:, (4 * class_id):(4 * class_id + 4)]
+        raw_class_objects = decode(
+            proposals,
+            class_bboxes * TARGET_VARIANCES,
+        )
+
+        # Clip bboxes so they don't go out of the image.
+        class_objects = clip_boxes(raw_class_objects, im_shape)
+
+        # Filter objects based on the min probability threshold and on them
+        # having a valid area.
+        prob_filter = tf.greater_equal(class_prob, min_prob_threshold)
+
+        (x_min, y_min, x_max, y_max) = tf.unstack(class_objects, axis=1)
+        area_filter = tf.greater(
+            tf.maximum(x_max - x_min, 0.0)
+            * tf.maximum(y_max - y_min, 0.0),
+            0.0
+        )
+
+        object_filter = tf.logical_and(area_filter, prob_filter)
+
+        class_objects = tf.boolean_mask(class_objects, object_filter)
+        class_prob = tf.boolean_mask(class_prob, object_filter)
+
+        # We have to use the TensorFlow's bounding box convention to use
+        # the included function for NMS.
+        class_objects_tf = change_order(class_objects)
+
+        # Apply class NMS.
+        class_selected_idx = tf.image.non_max_suppression(
+            class_objects_tf, class_prob, class_max_detections,
+            iou_threshold=CLASS_NMS_THRESHOLD
+        )
+
+        # Using NMS resulting indices, gather values from Tensors.
+        class_objects_tf = tf.gather(class_objects_tf, class_selected_idx)
+        class_prob = tf.gather(class_prob, class_selected_idx)
+
+        # Revert to our bbox convention.
+        class_objects = change_order(class_objects_tf)
+
+        # We append values to a regular list which will later be
+        # transformed to a proper Tensor.
+        selected_boxes.append(class_objects)
+        selected_probs.append(class_prob)
+        # In the case of the class_id, since it is a loop on classes, we
+        # already have a fixed class_id. We use `tf.tile` to create that
+        # Tensor with the total number of indices returned by the NMS.
+        selected_labels.append(
+            tf.tile([class_id], [tf.shape(class_selected_idx)[0]])
+        )
+
+    # We use concat (axis=0) to generate a Tensor where the rows are
+    # stacked on top of each other
+    objects = tf.concat(selected_boxes, axis=0)
+    proposal_label = tf.concat(selected_labels, axis=0)
+    proposal_label_prob = tf.concat(selected_probs, axis=0)
+
+    # Get top-k detections of all classes.
+    k = tf.minimum(
+        TOTAL_MAX_DETECTIONS,
+        tf.shape(proposal_label_prob)[0]
+    )
+
+    top_k = tf.nn.top_k(proposal_label_prob, k=k)
+    top_k_proposal_label_prob = top_k.values
+    top_k_objects = tf.gather(objects, top_k.indices)
+    top_k_proposal_label = tf.gather(proposal_label, top_k.indices)
+
+    return (
+        top_k_objects,
+        top_k_proposal_label,
+        top_k_proposal_label_prob,
+    )
+
+
 def build_base_network(inputs):
     """Obtain the feature map for an input image."""
     # TODO: Not "building" anymore, change name.
@@ -408,7 +591,7 @@ def build_rcnn(features, num_classes):
     return rcnn_bbox, rcnn_cls_prob
 
 
-def build_model(inputs, num_classes):
+def build_model(inputs, num_classes, min_prob_threshold=0.0):
     """Build the whole model.
 
     Args:
@@ -450,8 +633,13 @@ def build_model(inputs, num_classes):
     bbox_pred, cls_prob = build_rcnn(features, num_classes)
 
     # Proposals.
+    # TODO: Not working when running in script (above?).
+    objects, labels, probs = rcnn_proposals(
+        proposals, bbox_pred, cls_prob, im_shape, num_classes,
+        min_prob_threshold=min_prob_threshold,
+    )
 
-    return bbox_pred
+    return objects, labels, probs
 
 
 def normalize_bboxes(proposals, im_shape):
@@ -529,9 +717,9 @@ def main(image_path):
 
     tf.enable_eager_execution()
     with tfe.restore_variables_on_create('checkpoint/fasterrcnn'):
-        result = build_model(image, NUM_CLASSES)
+        objects, labels, probs = build_model(image, NUM_CLASSES)
 
-    draw_bboxes(raw_image, result[:10])
+    draw_bboxes(raw_image, objects[:10])
     raw_image.save('out.png')
 
 
