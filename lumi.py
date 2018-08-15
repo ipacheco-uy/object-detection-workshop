@@ -10,14 +10,8 @@ from luminoth.tools.checkpoint import get_checkpoint_config
 from luminoth.utils.predicting import PredictorNetwork
 
 
-# Goes to `luminoth.<something>`. (Place where all generic task models are
+# Goes to `luminoth.tasks`. (Place where all generic task models are
 # located.)
-# TODO: `predict_image` creates and runs a Tensorflow session inside. How to
-# make compatible with eager? Can we detect wheter there's an active session
-# and reuse it? Can we use `tf.eager_enabled`? (Even though we don't support it
-# yet.)
-# TODO: Can we use `Detector` inside a notebook even if it creates a session
-# internally?
 class Detector(object):
     """Encapsulates an object detection model behavior.
 
@@ -29,6 +23,13 @@ class Detector(object):
     Attributes:
         classes (list of str): Ordered class names for the detector.
         prob (float): Default probability threshold for predictions.
+
+    TODO:
+        - Don't create a TF session internally (or make its creation optional)
+          in order to be compatible with both TF-Eager and Jupyter Notebooks.
+        - Manage multiple instantiations correctly in order to avoid creating
+          the same TF objects over and over (which appends the `_N` suffix to
+          the graph and makes the checkpoint loading fail).
     """
 
     DEFAULT_CHECKPOINT = 'accurate'
@@ -75,8 +76,11 @@ class Detector(object):
 
         self.prob = prob
 
-        # TODO: What to do when it's not present?
-        self._model_classes = self._network.class_labels
+        # Use the labels when available, integers when not.
+        self._model_classes = (
+            self._network.class_labels if self._network.class_labels
+            else list(range(config.model.network.num_classes))
+        )
         if classes:
             self.classes = set(classes)
             if not set(self._model_classes).issuperset(self.classes):
@@ -178,7 +182,9 @@ def build_colormap():
         Function that receives a label and returns a color tuple `(R, G, B)`
         for said label.
     """
-    # Build the 10-color palette to be used for all classes.
+    # Build the 10-color palette to be used for all classes. The following are
+    # the hex-codes for said colors (taken the default 10-categorical d3 color
+    # palette).
     palette = (
         '1f77b4ff7f0e2ca02cd627289467bd8c564be377c27f7f7fbcbd2217becf'
     )
@@ -208,6 +214,22 @@ def read_image(path):
     """
     full_path = os.path.expanduser(path)
     return np.array(Image.open(full_path).convert('RGB'))
+
+
+# Goes to `luminoth.io`.
+# TODO: Squeeze if batch_size == 1? Or add as option?
+# TODO: Allow `Detector.predict` to accept the output of `read_video` as input.
+# TODO: How to get the video's metadata, so we can rewrite it with detections?
+def read_video(path, batch_size=1):
+    """Reads a video located at `path` and outputs frames one by one.
+
+    Arguments:
+        path (str): Path to a valid video file in the filesystem.
+
+    Returns:
+        Generator that yields one `numpy.ndarray` of size `(batch_size, height,
+        width, channels)`.
+    """
 
 
 # Goes to `luminoth.vis`.
@@ -354,10 +376,7 @@ def main(image_path, checkpoint, save_path):
 
     click.echo(json.dumps(objects, indent=2))
 
-    vis_objects(
-        image,
-        objects
-    ).save(save_path)
+    vis_objects(image, objects).save(save_path)
 
 
 if __name__ == '__main__':
