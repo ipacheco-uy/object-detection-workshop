@@ -1,12 +1,11 @@
 import click
 import numpy as np
-import os
 import tensorflow as tf
 import tensorflow.contrib.eager as tfe
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
-from resnet import resnet_v1_101, resnet_v1_101_tail
+from workshop.resnet import resnet_v1_101, resnet_v1_101_tail
 
 
 _R_MEAN = 123.68
@@ -25,112 +24,6 @@ NMS_THRESHOLD = 0.7
 
 CLASS_NMS_THRESHOLD = 0.5
 TOTAL_MAX_DETECTIONS = 300
-
-
-def open_image(path):
-    path = os.path.expanduser(path)
-    raw_image = Image.open(path)
-    image = np.expand_dims(raw_image.convert('RGB'), axis=0)
-    return image
-
-
-def to_image(image_array):
-    return Image.fromarray(np.squeeze(image_array, axis=0))
-
-
-def draw_rectangle(draw, coordinates, color, width=1):
-    outline = tuple(color + [255])
-
-    for i in range(width):
-        coords = [
-            coordinates[0] - i,
-            coordinates[1] - i,
-            coordinates[2] + i,
-            coordinates[3] + i,
-        ]
-        if i == 0:
-            draw.rectangle(coords, outline=outline)
-        else:
-            draw.rectangle(coords, outline=outline)
-
-
-def draw_bboxes(image_array, objects):
-    # Receives a numpy array. Translate into a PIL image.
-    # TODO: Make optional, or more robust.
-    image = to_image(image_array)
-
-    # Open as 'RGBA' in order to draw translucent boxes.
-    draw = ImageDraw.Draw(image, 'RGBA')
-    for obj in objects:
-        color = [255, 0, 0]
-        draw_rectangle(draw, obj, color, width=2)
-
-    return image
-
-
-def draw_bboxes_with_labels(image_array, classes, objects, labels):
-    # Receives a numpy array. Translate into a PIL image.
-    # TODO: Make optional, or more robust.
-    image = to_image(image_array)
-
-    # Open as 'RGBA' in order to draw translucent boxes.
-    draw = ImageDraw.Draw(image, 'RGBA')
-    for obj, label in zip(objects, labels):
-        color = [255, 0, 0]
-        draw_rectangle(draw, obj, color, width=3)
-
-        # Draw the object's label.
-        font = ImageFont.truetype(
-            # TODO: Make this OS-agnostic.
-            '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf', 14
-        )
-
-        text = classes[label]
-        label_w, label_h = font.getsize(text)
-        background_coords = [
-            obj[0] + 1,
-            obj[1],
-            obj[0] + label_w + 2,
-            obj[1] + label_h + 3,
-        ]
-        draw.rectangle(background_coords, fill=tuple(color + [255]))
-
-        draw.text(obj[:2], text, font=font)
-
-    return image
-
-
-def clip_boxes(bboxes, imshape):
-    """
-    Clips bounding boxes to image boundaries based on image shape.
-
-    Args:
-        bboxes: Tensor with shape (num_bboxes, 4)
-            where point order is x1, y1, x2, y2.
-
-        imshape: Tensor with shape (2, )
-            where the first value is height and the next is width.
-
-    Returns
-        Tensor with same shape as bboxes but making sure that none
-        of the bboxes are outside the image.
-    """
-    with tf.name_scope('BoundingBoxTransform/clip_bboxes'):
-        bboxes = tf.cast(bboxes, dtype=tf.float32)
-        imshape = tf.cast(imshape, dtype=tf.float32)
-
-        x1, y1, x2, y2 = tf.split(bboxes, 4, axis=1)
-        width = imshape[1]
-        height = imshape[0]
-        x1 = tf.maximum(tf.minimum(x1, width - 1.0), 0.0)
-        x2 = tf.maximum(tf.minimum(x2, width - 1.0), 0.0)
-
-        y1 = tf.maximum(tf.minimum(y1, height - 1.0), 0.0)
-        y2 = tf.maximum(tf.minimum(y2, height - 1.0), 0.0)
-
-        bboxes = tf.concat([x1, y1, x2, y2], axis=1)
-
-        return bboxes
 
 
 def get_width_upright(bboxes):
@@ -513,25 +406,6 @@ def rcnn_proposals(proposals, bbox_pred, cls_prob, im_shape, num_classes,
         top_k_proposal_label,
         top_k_proposal_label_prob,
     )
-
-
-def build_base_network(inputs):
-    """Obtain the feature map for an input image."""
-    # TODO: Not "building" anymore, change name.
-    # Pre-process inputs as required by the Resnet (just substracting means).
-    means = tf.constant([_R_MEAN, _G_MEAN, _B_MEAN], dtype=tf.float32)
-    processed_inputs = inputs - means
-
-    _, endpoints = resnet_v1_101(
-        processed_inputs,
-        training=False,
-        global_pool=False,
-        output_stride=OUTPUT_STRIDE,
-    )
-
-    feature_map = endpoints['resnet_v1_101/block3']
-
-    return feature_map
 
 
 def build_rpn(feature_map):
