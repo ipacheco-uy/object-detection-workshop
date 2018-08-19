@@ -10,5 +10,8 @@ setup(
         'click',
         'ipython',
         'ipdb',
+        'jupyter',
+        'matplotlib',
+        'Pillow',
     ],
 )
