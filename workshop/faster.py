@@ -15,6 +15,17 @@ CLASS_NMS_THRESHOLD = 0.5
 TOTAL_MAX_DETECTIONS = 300
 
 
+def sort_anchors(anchors):
+    """Sort the anchor references aspect ratio first, then area."""
+    widths = anchors[:, 2] - anchors[:, 0]
+    heights = anchors[:, 3] - anchors[:, 1]
+
+    aspect_ratios = np.round(heights / widths, 1)
+    areas = widths * heights
+
+    return anchors[np.lexsort((areas, aspect_ratios)), :]
+
+
 def change_order(bboxes):
     first_min, second_min, first_max, second_max = tf.unstack(
         bboxes, axis=1
