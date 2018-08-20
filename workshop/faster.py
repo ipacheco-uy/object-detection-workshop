@@ -1,13 +1,15 @@
 import numpy as np
 import tensorflow as tf
 
-from workshop.resnet import resnet_v1_101
+from workshop.resnet import resnet_v1_101, resnet_v1_101_tail
 
 
 _R_MEAN = 123.68
 _G_MEAN = 116.78
 _B_MEAN = 103.94
 
+
+OUTPUT_STRIDE = 16
 
 CLASS_NMS_THRESHOLD = 0.5
 TOTAL_MAX_DETECTIONS = 300
@@ -70,10 +72,6 @@ def clip_boxes(bboxes, imshape):
 
 def run_base_network(inputs):
     """Obtain the feature map for an input image."""
-    # TODO: This is shared with the constant in the notebook; should receive as
-    # parameter.
-    OUTPUT_STRIDE = 16
-
     # Pre-process inputs as required by the Resnet (just substracting means).
     means = tf.constant([_R_MEAN, _G_MEAN, _B_MEAN], dtype=tf.float32)
     processed_inputs = inputs - means
@@ -88,6 +86,20 @@ def run_base_network(inputs):
     feature_map = endpoints['resnet_v1_101/block3']
 
     return feature_map
+
+
+def run_resnet_tail(inputs):
+    """Pass `inputs` through the last block of the Resnet.
+
+    Arguments:
+        inputs: Tensor of shape (total_proposals, pool_size, pool_size, 1024),
+            the result of the RoI pooling layer.j
+
+    Returns:
+        Tensor of shape (total_proposals, pool_size, pool_size, 2048), with the
+        output of the final block.
+    """
+    return resnet_v1_101_tail(inputs)[0]
 
 
 # TODO: Same as below but for `get_width_upright`.
@@ -106,8 +118,6 @@ def decode(roi, deltas):
     bbox_x1 = pred_ur_x - 0.5 * pred_w
     bbox_y1 = pred_ur_y - 0.5 * pred_h
 
-    # This -1. extra is different from reference implementation.
-    # TODO: What does this do?
     bbox_x2 = pred_ur_x + 0.5 * pred_w - 1.
     bbox_y2 = pred_ur_y + 0.5 * pred_h - 1.
 

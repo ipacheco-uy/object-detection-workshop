@@ -72,7 +72,6 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
                     inputs, depth, [1, 1], strides=stride, use_bias=False,
                     padding='same',
                 )
-                # TODO: Make params configurable. Here and everywhere.
                 shortcut = tf.layers.batch_normalization(
                     pre_shortcut, momentum=0.997, epsilon=1e-5, training=False,
                     fused=False
@@ -90,7 +89,6 @@ def bottleneck(inputs, depth, depth_bottleneck, stride, rate=1,
             residual = tf.nn.relu(residual)
 
         with tf.variable_scope('conv2'):
-            # TODO: Necessary?
             residual = conv2d_same(
                 residual, depth_bottleneck, 3, strides=stride,
                 dilation_rate=rate,
@@ -379,7 +377,6 @@ resnet_v1.default_image_size = 224
 def resnet_v1_101(inputs, training=True, global_pool=True,
                   output_stride=None, reuse=None, scope='resnet_v1_101'):
 
-    # TODO: Can we not build the block 4?
     blocks = [
         resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
         resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
