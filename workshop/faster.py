@@ -28,8 +28,8 @@ def change_order(bboxes):
 def get_width_upright(bboxes):
     bboxes = tf.cast(bboxes, tf.float32)
     x1, y1, x2, y2 = tf.split(bboxes, 4, axis=1)
-    width = x2 - x1 + 1.
-    height = y2 - y1 + 1.
+    width = x2 - x1
+    height = y2 - y1
 
     # Calculate up right point of bbox (urx = up right x)
     urx = x1 + .5 * width
@@ -118,8 +118,8 @@ def decode(roi, deltas):
     bbox_x1 = pred_ur_x - 0.5 * pred_w
     bbox_y1 = pred_ur_y - 0.5 * pred_h
 
-    bbox_x2 = pred_ur_x + 0.5 * pred_w - 1.
-    bbox_y2 = pred_ur_y + 0.5 * pred_h - 1.
+    bbox_x2 = pred_ur_x + 0.5 * pred_w
+    bbox_y2 = pred_ur_y + 0.5 * pred_h
 
     bboxes = tf.concat([
         bbox_x1, bbox_y1, bbox_x2, bbox_y2
