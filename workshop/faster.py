@@ -104,7 +104,7 @@ def run_resnet_tail(inputs):
 
     Arguments:
         inputs: Tensor of shape (total_proposals, pool_size, pool_size, 1024),
-            the result of the RoI pooling layer.j
+            the result of the RoI pooling layer.
 
     Returns:
         Tensor of shape (total_proposals, pool_size, pool_size, 2048), with the
@@ -113,7 +113,6 @@ def run_resnet_tail(inputs):
     return resnet_v1_101_tail(inputs)[0]
 
 
-# TODO: Same as below but for `get_width_upright`.
 def decode(roi, deltas):
     (
         roi_width, roi_height, roi_urx, roi_ury
@@ -139,7 +138,6 @@ def decode(roi, deltas):
     return bboxes
 
 
-# TODO: Avoid or hide the fact that we're implementing `decode` here.
 def rcnn_proposals(proposals, bbox_pred, cls_prob, im_shape, num_classes,
                    min_prob_threshold=0.0, class_max_detections=100):
     """
