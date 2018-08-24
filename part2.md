@@ -1,5 +1,7 @@
 # Luminoth Guided Demo — PyImageConf 2018
 
+![Luminoth Logo](https://user-images.githubusercontent.com/270983/31414425-c12314d2-ae15-11e7-8cc9-42d330b03310.png)
+
 ## Introduction
 
 In this part of the workshop, we will use the [Luminoth](https://luminoth.ai/) toolkit, which has an implementation of the Faster R-CNN method we have just seen.
