@@ -18,7 +18,7 @@ def pager(count, per_page, description='', **kwargs):
 
     slider_kwargs = {
         'min': 0,
-        'max': count // per_page,
+        'max': (count - 1) // per_page,
         'value': 0,
         'description': description,
         'layout': Layout(width='600px'),
